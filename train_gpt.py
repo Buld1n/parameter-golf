@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+import lzma
 import zlib
 from pathlib import Path
 
@@ -420,9 +421,24 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+EXPORT_BITS = int(os.environ.get("EXPORT_BITS", "6"))
+EXPORT_PACK_INT6 = bool(int(os.environ.get("EXPORT_PACK_INT6", "1")))
+if EXPORT_BITS not in (6, 8):
+    raise ValueError(f"EXPORT_BITS must be 6 or 8, got {EXPORT_BITS}")
+EXPORT_QMAX = (1 << (EXPORT_BITS - 1)) - 1
+EXPORT_INT8_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "EXPORT_INT8_NAME_PATTERNS",
+        "tok_emb,attn.c_q.weight,attn.c_k.weight,attn.c_v.weight,attn.proj.weight",
+    ).split(",")
+    if pattern
+)
+
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
+
 
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
@@ -432,7 +448,8 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+
+def quantize_float_tensor(t: Tensor, qmax: int) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
@@ -443,20 +460,58 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / float(qmax)).clamp_min(1.0 / float(qmax))
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / float(qmax) if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale
+
+
+def pack_int6_signed(q: Tensor) -> Tensor:
+    # Packs 4 signed int6 values (range [-31, 31]) into 3 bytes.
+    if q.dtype != torch.int8:
+        raise TypeError(f"pack_int6_signed expects int8, got {q.dtype}")
+    flat_i16 = q.reshape(-1).to(torch.int16) + 31
+    if torch.any((flat_i16 < 0) | (flat_i16 > 62)):
+        raise ValueError("int6 pack input contains values outside [-31, 31]")
+    u = flat_i16.to(torch.uint8)
+    n = int(u.numel())
+    pad = (-n) % 4
+    if pad:
+        u = torch.cat((u, torch.zeros((pad,), dtype=torch.uint8)), dim=0)
+    u = u.view(-1, 4)
+    b0 = u[:, 0] | ((u[:, 1] & 0x03) << 6)
+    b1 = ((u[:, 1] >> 2) & 0x0F) | ((u[:, 2] & 0x0F) << 4)
+    b2 = ((u[:, 2] >> 4) & 0x03) | ((u[:, 3] & 0x3F) << 2)
+    return torch.stack((b0, b1, b2), dim=1).reshape(-1).contiguous()
+
+
+def unpack_int6_signed(packed: Tensor, num_values: int) -> Tensor:
+    if num_values <= 0:
+        return torch.empty((0,), dtype=torch.int8)
+    if packed.dtype != torch.uint8:
+        packed = packed.to(torch.uint8)
+    triplets = packed.view(-1, 3)
+    b0 = triplets[:, 0]
+    b1 = triplets[:, 1]
+    b2 = triplets[:, 2]
+    v0 = b0 & 0x3F
+    v1 = ((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2)
+    v2 = ((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4)
+    v3 = (b2 >> 2) & 0x3F
+    vals = torch.stack((v0, v1, v2, v3), dim=1).reshape(-1)
+    vals = vals[:num_values]
+    return (vals.to(torch.int16) - 31).to(torch.int8).contiguous()
+
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
+    # - per-row low-bit quantization for 2D float tensors
+    # - per-tensor low-bit quantization for other float tensors
     # - exact passthrough for non-floats
     # - passthrough for small float tensors, stored as fp16 to save bytes
     quantized: dict[str, Tensor] = {}
@@ -491,26 +546,38 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
+        force_int8 = any(pattern in name for pattern in EXPORT_INT8_NAME_PATTERNS)
+        qmax = 127 if force_int8 else EXPORT_QMAX
+        q, s = quantize_float_tensor(t, qmax)
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        scales[name] = s
+
+        if EXPORT_BITS == 6 and EXPORT_PACK_INT6 and (not force_int8) and q.ndim == 2:
+            packed = pack_int6_signed(q)
+            quantized[name] = packed
+            qmeta[name] = {"scheme": "int6_packed_row", "axis": 0, "shape": [int(q.shape[0]), int(q.shape[1])]}
+            stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
+            continue
+
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "intx_clean_per_row_v2",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
         "passthrough": passthrough,
+        "export_bits": EXPORT_BITS,
     }
     if qmeta:
         obj["qmeta"] = qmeta
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
+
 
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
@@ -519,7 +586,16 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        meta = qmeta.get(name, {})
+        if meta.get("scheme") == "int6_packed_row":
+            shape = meta.get("shape", [])
+            if not (isinstance(shape, list) and len(shape) == 2):
+                raise ValueError(f"Missing int6 packed shape metadata for tensor: {name}")
+            rows, cols = int(shape[0]), int(shape[1])
+            q_unpacked = unpack_int6_signed(q, rows * cols).view(rows, cols)
+            s = s.to(dtype=torch.float32)
+            out[name] = (q_unpacked.float() * s.view(rows, *([1] * (q_unpacked.ndim - 1)))).to(dtype=dtype).contiguous()
+        elif meta.get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
@@ -1363,7 +1439,7 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = lzma.compress(quant_raw, preset=9 | lzma.PRESET_EXTREME)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1381,7 +1457,7 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
