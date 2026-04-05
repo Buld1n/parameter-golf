@@ -32,18 +32,21 @@ Promotion gates:
 ## New Model Knobs (implemented in `train_gpt.py`)
 
 - `MLP_ACT`:
-  - `relu2` (default, baseline-compatible)
+  - `relu2`
   - `lrelu2`
   - `gelu`
   - `swiglu`
-- `MLP_MULT` now accepts float (finer width control)
+- `MLP_MULT` accepts float (finer width control)
 - `MLP_LEAKY_RELU_SLOPE` (default `0.5`, used for `lrelu2`)
-- `SWIGLU_PARAM_MATCH` (`1` default): keeps SwiGLU hidden width near relu2 parameter budget
-- `ROPE_DIMS` (`0` default): partial RoPE when set to an even value in `(0, head_dim]`
+- `SWIGLU_PARAM_MATCH` (`1` default): keeps SwiGLU hidden width near the relu2 parameter budget
+- `ROPE_DIMS` (`16` in the tuned fork defaults): partial RoPE when set to an even value in `(0, head_dim]`
 - `XSA_LAST_N` (`0` default): enables XSA on the last `N` transformer layers
 - `LN_SCALE` (`0` default): depth-aware residual scale init (`1/sqrt(layer_idx+1)`)
-- `EVAL_SLIDING`, `EVAL_STRIDE`: sliding-window validation mode for better BPB scoring
+- `EVAL_SLIDING`, `EVAL_STRIDE`: gates the final sliding-window validation pass
 - `EMA_ENABLED`, `EMA_DECAY`, `EMA_START_STEP`, `EMA_EVAL_AFTER_APPLY`
+- `LATE_QAT_THRESHOLD` (`QAT_THRESHOLD` alias supported); `LATE_QAT=0` disables late QAT entirely
+
+Note: this fork keeps tuned defaults in `train_gpt.py` for convenient remote runs. For A/B work, the commands below set the relevant knobs explicitly rather than relying on defaults.
 
 ## Starter Commands
 
@@ -53,6 +56,9 @@ Baseline:
 RUN_ID=ab_base \
 MLP_ACT=relu2 \
 MLP_MULT=2.0 \
+SWA_ENABLED=0 \
+EMA_ENABLED=0 \
+EVAL_SLIDING=0 \
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 ```
 
@@ -63,6 +69,9 @@ RUN_ID=ab_lrelu2 \
 MLP_ACT=lrelu2 \
 MLP_LEAKY_RELU_SLOPE=0.5 \
 MLP_MULT=2.0 \
+SWA_ENABLED=0 \
+EMA_ENABLED=0 \
+EVAL_SLIDING=0 \
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 ```
 
@@ -73,6 +82,9 @@ RUN_ID=ab_swiglu \
 MLP_ACT=swiglu \
 MLP_MULT=2.0 \
 SWIGLU_PARAM_MATCH=1 \
+SWA_ENABLED=0 \
+EMA_ENABLED=0 \
+EVAL_SLIDING=0 \
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 ```
 
@@ -86,7 +98,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt.py
 ## Helper Scripts
 
 - `scripts/setup_env.sh`: creates `.venv` and installs `requirements.txt`.
-- `scripts/run_first_sweep.sh`: runs a first A/B sweep (baseline, activation variants, EMA).
+- `scripts/run_first_sweep.sh`: runs a first A/B sweep with explicit activation/EMA/sliding toggles.
 - `scripts/summarize_runs.py`: parses `logs/*.txt` and prints sortable metrics table.
 - `scripts/init_submission.py`: scaffolds a `records/...` submission folder from a run log.
 

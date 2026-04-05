@@ -24,6 +24,25 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
+
+
+def _getenv_bool(name: str, default: bool) -> bool:
+    return bool(int(os.environ.get(name, "1" if default else "0")))
+
+
+def _getenv_float(name: str, default: float, fallback: str | None = None) -> float:
+    raw = os.environ.get(name)
+    if raw is None and fallback is not None:
+        raw = os.environ.get(fallback)
+    return float(raw) if raw is not None else default
+
+
+def _get_late_qat_threshold(default: float) -> float:
+    if "LATE_QAT" in os.environ and not _getenv_bool("LATE_QAT", True):
+        return 0.0
+    return _getenv_float("LATE_QAT_THRESHOLD", default, fallback="QAT_THRESHOLD")
+
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -50,6 +69,7 @@ class Hyperparameters:
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     mlp_act = os.environ.get("MLP_ACT", "lrelu2").strip().lower()
     mlp_leaky_relu_slope = float(os.environ.get("MLP_LEAKY_RELU_SLOPE", 0.5))
+    swiglu_param_match = _getenv_bool("SWIGLU_PARAM_MATCH", True)
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -67,12 +87,17 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    eval_sliding = _getenv_bool("EVAL_SLIDING", True)
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 50))  # tighter: collect more recent checkpoints
+    ema_enabled = _getenv_bool("EMA_ENABLED", True)
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 0))
+    ema_eval_after_apply = _getenv_bool("EMA_EVAL_AFTER_APPLY", True)
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
@@ -82,7 +107,7 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    late_qat_threshold = _get_late_qat_threshold(0.15)
     recompile_on_late_qat = bool(int(os.environ.get("RECOMPILE_ON_LATE_QAT", "1")))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
@@ -586,20 +611,37 @@ class ValueEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int, mlp_act: str, mlp_leaky_relu_slope: float):
+    def __init__(
+        self,
+        dim: int,
+        mlp_mult: float,
+        mlp_act: str,
+        mlp_leaky_relu_slope: float,
+        swiglu_param_match: bool,
+    ):
         super().__init__()
-        hidden = int(mlp_mult * dim)
+        hidden = max(1, int(round(mlp_mult * dim)))
         self.mlp_act = mlp_act
         self.mlp_leaky_relu_slope = mlp_leaky_relu_slope
+        self.swiglu_param_match = swiglu_param_match
+        if self.mlp_act == "swiglu" and self.swiglu_param_match:
+            hidden = max(1, int(round((2.0 * hidden) / 3.0)))
         self.fc = CastedLinear(dim, hidden, bias=False)
+        self.gate = CastedLinear(dim, hidden, bias=False) if self.mlp_act == "swiglu" else None
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
     def forward(self, x: Tensor) -> Tensor:
+        if self.mlp_act == "swiglu":
+            if self.gate is None:
+                raise RuntimeError("SwiGLU gate projection was not initialized")
+            return self.proj(self.fc(x) * F.silu(self.gate(x)))
         x = self.fc(x)
         if self.mlp_act == "relu2":
             return self.proj(torch.relu(x).square())
         if self.mlp_act == "lrelu2":
             return self.proj(F.leaky_relu(x, negative_slope=self.mlp_leaky_relu_slope).square())
+        if self.mlp_act == "gelu":
+            return self.proj(F.gelu(x))
         raise ValueError(f"Unsupported MLP_ACT={self.mlp_act}")
 class Block(nn.Module):
     def __init__(
@@ -607,9 +649,10 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         mlp_act: str,
         mlp_leaky_relu_slope: float,
+        swiglu_param_match: bool,
         rope_base: float,
         qk_gain_init: float,
         layer_idx: int = 0,
@@ -620,7 +663,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult, mlp_act, mlp_leaky_relu_slope)
+        self.mlp = MLP(dim, mlp_mult, mlp_act, mlp_leaky_relu_slope, swiglu_param_match)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -649,9 +692,10 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         mlp_act: str,
         mlp_leaky_relu_slope: float,
+        swiglu_param_match: bool,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -694,6 +738,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     mlp_act,
                     mlp_leaky_relu_slope,
+                    swiglu_param_match,
                     rope_base,
                     qk_gain_init,
                     layer_idx=i,
@@ -1058,6 +1103,7 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         mlp_act=args.mlp_act,
         mlp_leaky_relu_slope=args.mlp_leaky_relu_slope,
+        swiglu_param_match=args.swiglu_param_match,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1155,7 +1201,10 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
-    log0(f"mlp_act:{args.mlp_act} mlp_leaky_relu_slope:{args.mlp_leaky_relu_slope:.3f}")
+    log0(
+        f"mlp_act:{args.mlp_act} mlp_leaky_relu_slope:{args.mlp_leaky_relu_slope:.3f} "
+        f"swiglu_param_match:{int(args.swiglu_param_match)}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1170,6 +1219,11 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        f"ema_enabled:{int(args.ema_enabled)} ema_decay:{args.ema_decay:.4f} "
+        f"ema_start_step:{args.ema_start_step} ema_eval_after_apply:{int(args.ema_eval_after_apply)}"
+    )
+    log0(f"eval_sliding:{int(args.eval_sliding)} eval_stride:{args.eval_stride}")
     log0(f"late_qat_threshold:{args.late_qat_threshold:.3f} recompile_on_late_qat:{args.recompile_on_late_qat}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     def zero_grad_all() -> None:
@@ -1211,10 +1265,14 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    def clone_state_float() -> dict[str, Tensor]:
+        return {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
-    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
-    ema_decay = 0.997
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_enabled and args.ema_start_step <= 0:
+        ema_state = clone_state_float()
+        log0(f"ema:start step:0 decay:{args.ema_decay:.4f}")
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1281,11 +1339,15 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
-        # EMA update
-        with torch.no_grad():
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
+        if args.ema_enabled and step >= args.ema_start_step:
+            with torch.no_grad():
+                if ema_state is None:
+                    ema_state = clone_state_float()
+                    log0(f"ema:start step:{step} decay:{args.ema_decay:.4f}")
+                else:
+                    for name, t in base_model.state_dict().items():
+                        ema_state[name].mul_(args.ema_decay).add_(t.detach().float(), alpha=1.0 - args.ema_decay)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
             if swa_state is None:
@@ -1316,22 +1378,27 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    # Apply EMA weights (better than SWA alone per PR#401)
-    log0("ema:applying EMA weights")
-    current_state = base_model.state_dict()
-    avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
-    base_model.load_state_dict(avg_state, strict=True)
-    torch.cuda.synchronize()
-    t_diag = time.perf_counter()
-    diag_val_loss, diag_val_bpb = eval_val(
-        args, compiled_model, rank, world_size, device, grad_accum_steps,
-        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
-    )
+    if args.ema_enabled and ema_state is not None:
+        log0("ema:applying EMA weights")
+        current_state = base_model.state_dict()
+        avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+        base_model.load_state_dict(avg_state, strict=True)
+        if args.ema_eval_after_apply:
+            torch.cuda.synchronize()
+            t_diag = time.perf_counter()
+            diag_val_loss, diag_val_bpb = eval_val(
+                args, compiled_model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
+                f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
+            )
+    elif args.ema_enabled:
+        log0("ema:no_snapshots using current weights")
+    else:
+        log0("ema:disabled using current weights")
     full_state_dict = base_model.state_dict()
     export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
@@ -1370,6 +1437,7 @@ def main() -> None:
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         mlp_act=args.mlp_act, mlp_leaky_relu_slope=args.mlp_leaky_relu_slope,
+        swiglu_param_match=args.swiglu_param_match,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         mtp_num_heads=0, mtp_loss_weight=0.0,
@@ -1398,7 +1466,9 @@ def main() -> None:
     )
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     sw_seq_len = effective_eval_seq_len
-    if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+    if not args.eval_sliding or args.eval_stride <= 0 or args.eval_stride >= sw_seq_len:
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.eval_sliding and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
         sw_val_loss, sw_val_bpb = eval_val_sliding(
@@ -1414,7 +1484,7 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-    if args.eval_stride != 64 and 64 < sw_seq_len:
+    if args.eval_sliding and args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
         sw64_val_loss, sw64_val_bpb = eval_val_sliding(

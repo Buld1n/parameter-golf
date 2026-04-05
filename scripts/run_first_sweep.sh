@@ -59,7 +59,8 @@ run_one ab_base \
   XSA_LAST_N=0 \
   LN_SCALE=0 \
   EVAL_SLIDING=0 \
-  EMA_ENABLED=0
+  EMA_ENABLED=0 \
+  SWA_ENABLED=0
 
 run_one ab_lrelu2_xsa \
   env \
@@ -72,7 +73,8 @@ run_one ab_lrelu2_xsa \
   XSA_LAST_N=4 \
   LN_SCALE=1 \
   EVAL_SLIDING=0 \
-  EMA_ENABLED=0
+  EMA_ENABLED=0 \
+  SWA_ENABLED=0
 
 run_one ab_swiglu \
   env \
@@ -85,7 +87,8 @@ run_one ab_swiglu \
   XSA_LAST_N=4 \
   LN_SCALE=1 \
   EVAL_SLIDING=0 \
-  EMA_ENABLED=0
+  EMA_ENABLED=0 \
+  SWA_ENABLED=0
 
 run_one ab_lrelu2_xsa_ema_sliding \
   env \
@@ -101,7 +104,8 @@ run_one ab_lrelu2_xsa_ema_sliding \
   EVAL_STRIDE=64 \
   EMA_ENABLED=1 \
   EMA_DECAY=0.997 \
-  EMA_START_STEP=0
+  EMA_START_STEP=0 \
+  SWA_ENABLED=0
 
 echo
 echo "Sweep complete. Summary:"
