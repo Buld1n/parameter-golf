@@ -659,6 +659,15 @@ class GPT(nn.Module):
             self.decoder_indices = list(
                 range(self.num_encoder_layers, h.num_layers)
             )
+        visit_counts = [0] * h.num_layers
+        self.encoder_pass_indices = []
+        for idx in self.encoder_indices:
+            self.encoder_pass_indices.append(visit_counts[idx])
+            visit_counts[idx] += 1
+        self.decoder_pass_indices = []
+        for idx in self.decoder_indices:
+            self.decoder_pass_indices.append(visit_counts[idx])
+            visit_counts[idx] += 1
         self.num_skip_weights = min(
             len(self.encoder_indices), len(self.decoder_indices)
         )
@@ -705,26 +714,30 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
         skips = []
-        enc_iter = (
-            self.encoder_indices
-            if self.looping_active
-            else range(self.num_encoder_layers)
-        )
-        dec_iter = (
-            self.decoder_indices
-            if self.looping_active
-            else range(
-                self.num_encoder_layers,
-                self.num_encoder_layers + self.num_decoder_layers,
+        if self.looping_active:
+            enc_iter = zip(
+                self.encoder_indices,
+                self.encoder_pass_indices,
             )
-        )
-        visit_counts = collections.defaultdict(int)
-        for i in enc_iter:
-            pass_idx = visit_counts[i]
-            visit_counts[i] += 1
+            dec_iter = zip(
+                self.decoder_indices,
+                self.decoder_pass_indices,
+            )
+        else:
+            enc_iter = (
+                (i, 0) for i in range(self.num_encoder_layers)
+            )
+            dec_iter = (
+                (i, 0)
+                for i in range(
+                    self.num_encoder_layers,
+                    self.num_encoder_layers + self.num_decoder_layers,
+                )
+            )
+        for i, pass_idx in enc_iter:
             x = self.blocks[i](x, x0, pass_idx=pass_idx)
             skips.append(x)
-        for skip_idx, i in enumerate(dec_iter):
+        for skip_idx, (i, pass_idx) in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
                 scaled_skip = (
                     self.skip_weights[skip_idx].to(dtype=x.dtype)[
@@ -739,8 +752,6 @@ class GPT(nn.Module):
                     x = torch.lerp(scaled_skip, x, g)
                 else:
                     x = x + scaled_skip
-            pass_idx = visit_counts[i]
-            visit_counts[i] += 1
             x = self.blocks[i](x, x0, pass_idx=pass_idx)
         x = self.final_norm(x)
         if self.head_proj is not None:
