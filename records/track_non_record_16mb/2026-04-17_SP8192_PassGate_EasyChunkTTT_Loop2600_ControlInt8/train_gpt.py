@@ -75,6 +75,12 @@ class Hyperparameters:
     token_route_mlp_mult = float(
         os.environ.get("TOKEN_ROUTE_MLP_MULT", 1.5)
     )
+    shared_adapter_dim = int(os.environ.get("SHARED_ADAPTER_DIM", 0))
+    shared_adapter_start = int(os.environ.get("SHARED_ADAPTER_START", 1))
+    shared_adapter_end = int(os.environ.get("SHARED_ADAPTER_END", 9))
+    shared_adapter_scale_init = float(
+        os.environ.get("SHARED_ADAPTER_SCALE_INIT", 1.0)
+    )
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -508,6 +514,17 @@ class MLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 
+class SharedAdapter(nn.Module):
+    def __init__(self, dim, bottleneck):
+        super().__init__()
+        self.fc = CastedLinear(dim, bottleneck, bias=False)
+        self.proj = CastedLinear(bottleneck, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x):
+        return self.proj(F.silu(self.fc(x)))
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -721,6 +738,24 @@ class GPT(nn.Module):
                     train_seq_len=h.train_seq_len,
                     rope_dims=h.rope_dims,
                 )
+        self.shared_adapter = (
+            SharedAdapter(h.model_dim, h.shared_adapter_dim)
+            if h.shared_adapter_dim > 0
+            else None
+        )
+        self.shared_adapter_start = h.shared_adapter_start
+        self.shared_adapter_end = h.shared_adapter_end
+        self.shared_adapter_scales = (
+            nn.Parameter(
+                torch.full(
+                    (h.num_layers,),
+                    h.shared_adapter_scale_init,
+                    dtype=torch.float32,
+                )
+            )
+            if self.shared_adapter is not None
+            else None
+        )
         self.final_norm = RMSNorm()
         self.lm_head = (
             None
@@ -805,6 +840,18 @@ class GPT(nn.Module):
             block.parallel = active and i >= self.parallel_residual_start
         self.parallel_residual_active = active
 
+    def _apply_shared_adapter(self, x, block_idx):
+        if (
+            self.shared_adapter is None
+            or block_idx < self.shared_adapter_start
+            or block_idx > self.shared_adapter_end
+        ):
+            return x
+        adapter_in = F.rms_norm(x, (x.size(-1),))
+        adapter_out = self.shared_adapter(adapter_in)
+        scale = self.shared_adapter_scales[block_idx].to(dtype=x.dtype)
+        return x + scale * adapter_out
+
     def forward_logits(self, input_ids):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -834,6 +881,7 @@ class GPT(nn.Module):
             )
         for i, pass_idx in enc_iter:
             x = self.blocks[i](x, x0, pass_idx=pass_idx)
+            x = self._apply_shared_adapter(x, i)
             skips.append(x)
         for skip_idx, (i, pass_idx) in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
@@ -851,6 +899,7 @@ class GPT(nn.Module):
                 else:
                     x = x + scaled_skip
             x = self.blocks[i](x, x0, pass_idx=pass_idx)
+            x = self._apply_shared_adapter(x, i)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -983,7 +1032,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,recur_attn_delta,q_gain,route_score,route_scale,skip_weight,skip_weights,skip_gates",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,recur_attn_delta,q_gain,route_score,route_scale,shared_adapter_scales,skip_weight,skip_weights,skip_gates",
     ).split(",")
     if pattern
 )
@@ -992,6 +1041,11 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 class Optimizers:
     def __init__(self, h, base_model):
         block_named_params = list(base_model.blocks.named_parameters())
+        adapter_named_params = (
+            list(base_model.shared_adapter.named_parameters())
+            if base_model.shared_adapter is not None
+            else []
+        )
         matrix_params = [
             p
             for (name, p) in block_named_params
@@ -1000,12 +1054,21 @@ class Optimizers:
                 pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS
             )
         ]
+        matrix_params.extend(
+            [
+                p
+                for (_, p) in adapter_named_params
+                if p.ndim == 2
+            ]
+        )
         scalar_params = [
             p
             for (name, p) in block_named_params
             if p.ndim < 2
             or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
+        if base_model.shared_adapter_scales is not None:
+            scalar_params.append(base_model.shared_adapter_scales)
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
         if (
@@ -1215,6 +1278,7 @@ CONTROL_INT8_SUBSTRINGS = (
     "q_gain",
     "route_score",
     "route_scale",
+    "shared_adapter_scales",
     "skip_weight",
     "skip_weights",
     "skip_gates",
