@@ -83,6 +83,12 @@ class Hyperparameters:
     )
     aux_exit_layer = int(os.environ.get("AUX_EXIT_LAYER", -1))
     aux_exit_weight = float(os.environ.get("AUX_EXIT_WEIGHT", 0.0))
+    aux_exit_distill_weight = float(
+        os.environ.get("AUX_EXIT_DISTILL_WEIGHT", 0.0)
+    )
+    aux_exit_distill_temp = float(
+        os.environ.get("AUX_EXIT_DISTILL_TEMP", 1.0)
+    )
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -760,6 +766,8 @@ class GPT(nn.Module):
         )
         self.aux_exit_layer = h.aux_exit_layer
         self.aux_exit_weight = h.aux_exit_weight
+        self.aux_exit_distill_weight = h.aux_exit_distill_weight
+        self.aux_exit_distill_temp = h.aux_exit_distill_temp
         self.final_norm = RMSNorm()
         self.lm_head = (
             None
@@ -935,7 +943,13 @@ class GPT(nn.Module):
         return logits
 
     def forward(self, input_ids, target_ids):
-        if self.aux_exit_weight > 0.0 and self.aux_exit_layer >= 0:
+        if (
+            (
+                self.aux_exit_weight > 0.0
+                or self.aux_exit_distill_weight > 0.0
+            )
+            and self.aux_exit_layer >= 0
+        ):
             logits, aux_logits = self.forward_logits(input_ids, return_aux=True)
         else:
             logits = self.forward_logits(input_ids)
@@ -946,12 +960,28 @@ class GPT(nn.Module):
             reduction="mean",
         )
         if aux_logits is not None:
-            aux_loss = F.cross_entropy(
-                aux_logits.reshape(-1, aux_logits.size(-1)).float(),
-                target_ids.reshape(-1),
-                reduction="mean",
-            )
-            loss = loss + self.aux_exit_weight * aux_loss
+            if self.aux_exit_weight > 0.0:
+                aux_loss = F.cross_entropy(
+                    aux_logits.reshape(-1, aux_logits.size(-1)).float(),
+                    target_ids.reshape(-1),
+                    reduction="mean",
+                )
+                loss = loss + self.aux_exit_weight * aux_loss
+            if self.aux_exit_distill_weight > 0.0:
+                temp = self.aux_exit_distill_temp
+                student = (
+                    aux_logits.reshape(-1, aux_logits.size(-1)).float() / temp
+                )
+                teacher = (
+                    logits.detach().reshape(-1, logits.size(-1)).float()
+                    / temp
+                )
+                aux_kl = F.kl_div(
+                    F.log_softmax(student, dim=-1),
+                    F.softmax(teacher, dim=-1),
+                    reduction="batchmean",
+                ) * (temp**2)
+                loss = loss + self.aux_exit_distill_weight * aux_kl
         return loss
 
 
