@@ -81,6 +81,8 @@ class Hyperparameters:
     shared_adapter_scale_init = float(
         os.environ.get("SHARED_ADAPTER_SCALE_INIT", 1.0)
     )
+    aux_exit_layer = int(os.environ.get("AUX_EXIT_LAYER", -1))
+    aux_exit_weight = float(os.environ.get("AUX_EXIT_WEIGHT", 0.0))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -756,6 +758,8 @@ class GPT(nn.Module):
             if self.shared_adapter is not None
             else None
         )
+        self.aux_exit_layer = h.aux_exit_layer
+        self.aux_exit_weight = h.aux_exit_weight
         self.final_norm = RMSNorm()
         self.lm_head = (
             None
@@ -852,13 +856,26 @@ class GPT(nn.Module):
         scale = self.shared_adapter_scales[block_idx].to(dtype=x.dtype)
         return x + scale * adapter_out
 
-    def forward_logits(self, input_ids):
+    def _project_logits(self, x):
+        x = self.final_norm(x)
+        if self.head_proj is not None:
+            x = self.head_proj(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(
+            logits_proj / self.logit_softcap
+        )
+
+    def forward_logits(self, input_ids, return_aux=False):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
             x = self.embed_proj(x)
         x0 = x
         skips = []
+        aux_hidden = None
         if self.looping_active:
             enc_iter = zip(
                 self.encoder_indices,
@@ -882,6 +899,12 @@ class GPT(nn.Module):
         for i, pass_idx in enc_iter:
             x = self.blocks[i](x, x0, pass_idx=pass_idx)
             x = self._apply_shared_adapter(x, i)
+            if (
+                return_aux
+                and i == self.aux_exit_layer
+                and aux_hidden is None
+            ):
+                aux_hidden = x
             skips.append(x)
         for skip_idx, (i, pass_idx) in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
@@ -900,24 +923,36 @@ class GPT(nn.Module):
                     x = x + scaled_skip
             x = self.blocks[i](x, x0, pass_idx=pass_idx)
             x = self._apply_shared_adapter(x, i)
-        x = self.final_norm(x)
-        if self.head_proj is not None:
-            x = self.head_proj(x)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
-        return self.logit_softcap * torch.tanh(
-            logits_proj / self.logit_softcap
-        )
+            if (
+                return_aux
+                and i == self.aux_exit_layer
+                and aux_hidden is None
+            ):
+                aux_hidden = x
+        logits = self._project_logits(x)
+        if return_aux and aux_hidden is not None:
+            return logits, self._project_logits(aux_hidden)
+        return logits
 
     def forward(self, input_ids, target_ids):
-        logits = self.forward_logits(input_ids)
-        return F.cross_entropy(
+        if self.aux_exit_weight > 0.0 and self.aux_exit_layer >= 0:
+            logits, aux_logits = self.forward_logits(input_ids, return_aux=True)
+        else:
+            logits = self.forward_logits(input_ids)
+            aux_logits = None
+        loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(),
             target_ids.reshape(-1),
             reduction="mean",
         )
+        if aux_logits is not None:
+            aux_loss = F.cross_entropy(
+                aux_logits.reshape(-1, aux_logits.size(-1)).float(),
+                target_ids.reshape(-1),
+                reduction="mean",
+            )
+            loss = loss + self.aux_exit_weight * aux_loss
+        return loss
 
 
 def classify_param(name):
