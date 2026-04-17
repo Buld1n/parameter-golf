@@ -62,6 +62,19 @@ class Hyperparameters:
     recur_attn_gate_scale = float(
         os.environ.get("RECUR_ATTN_GATE_SCALE", 0.5)
     )
+    token_route_enabled = bool(int(os.environ.get("TOKEN_ROUTE_ENABLED", "0")))
+    token_route_topk_frac = float(
+        os.environ.get("TOKEN_ROUTE_TOPK_FRAC", 0.25)
+    )
+    token_route_start_pass = int(
+        os.environ.get("TOKEN_ROUTE_START_PASS", 1)
+    )
+    token_route_min_tokens = int(
+        os.environ.get("TOKEN_ROUTE_MIN_TOKENS", 64)
+    )
+    token_route_mlp_mult = float(
+        os.environ.get("TOKEN_ROUTE_MLP_MULT", 1.5)
+    )
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -509,6 +522,11 @@ class Block(nn.Module):
         ln_scale=False,
         recur_attn_gate=False,
         recur_attn_gate_scale=0.5,
+        token_route_enabled=False,
+        token_route_topk_frac=0.25,
+        token_route_start_pass=1,
+        token_route_min_tokens=64,
+        token_route_mlp_mult=1.5,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -533,6 +551,23 @@ class Block(nn.Module):
             else None
         )
         self.recur_attn_gate_scale = recur_attn_gate_scale
+        self.route_score = (
+            nn.Parameter(torch.zeros(3, dim, dtype=torch.float32))
+            if token_route_enabled
+            else None
+        )
+        self.route_scale = (
+            nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            if token_route_enabled
+            else None
+        )
+        self.route_norm = RMSNorm() if token_route_enabled else None
+        self.route_mlp = (
+            MLP(dim, token_route_mlp_mult) if token_route_enabled else None
+        )
+        self.token_route_topk_frac = token_route_topk_frac
+        self.token_route_start_pass = token_route_start_pass
+        self.token_route_min_tokens = token_route_min_tokens
         self.ln_scale_factor = (
             1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         )
@@ -574,6 +609,52 @@ class Block(nn.Module):
             x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
                 None, None, :
             ] * self.mlp(mlp_in)
+        if (
+            self.route_mlp is not None
+            and pass_idx >= self.token_route_start_pass
+        ):
+            bsz, seqlen, dim = x_out.shape
+            k = max(
+                1,
+                min(
+                    seqlen,
+                    max(
+                        int(math.ceil(seqlen * self.token_route_topk_frac)),
+                        self.token_route_min_tokens,
+                    ),
+                ),
+            )
+            route_in = (self.route_norm(x_out) * self.ln_scale_factor).to(
+                dtype=x_out.dtype
+            )
+            route_idx = min(max(pass_idx, 0), self.route_score.size(0) - 1)
+            route_score = (
+                route_in.float().square().mean(dim=-1)
+                + 0.05
+                * (
+                    route_in
+                    * self.route_score[route_idx].to(dtype=route_in.dtype)[
+                        None, None, :
+                    ]
+                )
+                .mean(dim=-1)
+                .float()
+            )
+            top_idx = route_score.topk(k, dim=1, sorted=False).indices
+            flat_mask = torch.zeros(
+                bsz, seqlen, dtype=torch.bool, device=x_out.device
+            )
+            flat_mask.scatter_(1, top_idx, True)
+            selected = route_in.reshape(-1, dim)[flat_mask.reshape(-1)]
+            if selected.numel() > 0:
+                routed = torch.zeros(
+                    bsz * seqlen, dim, device=x_out.device, dtype=x_out.dtype
+                )
+                routed[flat_mask.reshape(-1)] = (
+                    self.route_scale.to(dtype=selected.dtype)[None, :]
+                    * self.route_mlp(selected)
+                )
+                x_out = x_out + routed.view(bsz, seqlen, dim)
         return x_out
 
 
@@ -617,6 +698,14 @@ class GPT(nn.Module):
                         h.recur_attn_gate and h.loop_start <= i <= h.loop_end
                     ),
                     recur_attn_gate_scale=h.recur_attn_gate_scale,
+                    token_route_enabled=(
+                        h.token_route_enabled
+                        and h.loop_start <= i <= h.loop_end
+                    ),
+                    token_route_topk_frac=h.token_route_topk_frac,
+                    token_route_start_pass=h.token_route_start_pass,
+                    token_route_min_tokens=h.token_route_min_tokens,
+                    token_route_mlp_mult=h.token_route_mlp_mult,
                 )
                 for i in range(h.num_layers)
             ]
@@ -784,7 +873,7 @@ class GPT(nn.Module):
 def classify_param(name):
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if ".mlp." in name:
+    if ".mlp." in name or ".route_mlp." in name:
         return "mlp"
     if ".attn." in name or ".proj." in name and ".mlp." not in name:
         return "attn"
@@ -893,7 +982,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,recur_attn_delta,q_gain,skip_weight,skip_weights,skip_gates",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,recur_attn_delta,q_gain,route_score,route_scale,skip_weight,skip_weights,skip_gates",
     ).split(",")
     if pattern
 )
@@ -1123,6 +1212,8 @@ CONTROL_INT8_SUBSTRINGS = (
     "resid_mixes",
     "recur_attn_delta",
     "q_gain",
+    "route_score",
+    "route_scale",
     "skip_weight",
     "skip_weights",
     "skip_gates",
